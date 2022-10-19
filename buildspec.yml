@@ -1,0 +1,67 @@
+version: 0.2
+
+env:
+  parameter-store:
+    REPOSITORY_URI: /DevOps/Prod/RepositoryUri
+    TASK_EXECUTION_ARN: /DevOps/Prod/TaskExecutionArn
+    TASK_FAMILY: /DevOps/Prod/TaskFamily
+    
+phases:
+  install:
+    runtime-versions:
+      nodejs: 16.x
+    commands:
+      - apt-get install wget apt-transport-https gnupg
+      - wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | apt-key add -
+      - echo deb https://aquasecurity.github.io/trivy-repo/deb bionic main | tee -a /etc/apt/sources.list.d/trivy.list
+      - apt-get update
+      - apt-get install -y trivy
+      - pip3 install boto3
+      - echo 'DONE'
+  pre_build:
+    commands:
+      - echo Build Application
+      - npm install
+      - npm run build
+      - mv Dockerfile dist/angular
+      - cd dist/angular
+      - echo Logging in to Amazon ECR...
+      - aws --version
+      - aws ecr-public get-login-password --region us-east-1 | docker login --username AWS --password-stdin public.ecr.aws
+      - aws ecr get-login-password | docker login --username AWS --password-stdin $REPOSITORY_URI
+      - COMMIT_HASH=$(echo $CODEBUILD_RESOLVED_SOURCE_VERSION | cut -c 1-7)
+      - IMAGE_TAG=${COMMIT_HASH:=latest}
+  build:
+    commands:
+      - sed -i 's@AWS_REGION@'$AWS_REGION'@g' Dockerfile
+      - echo Docker build and tagging started on `date`
+      - docker build -t $REPOSITORY_URI:latest -t $REPOSITORY_URI:$IMAGE_TAG .
+      - echo Docker build and tagging completed on `date`
+      - echo Report Sent to Security Hub on `date`
+      - cd ../..
+      - echo Build completed on `date`
+      - echo Pushing the docker images...
+      - trivy image -f json -o results.json --exit-code 1 --severity HIGH,CRITICAL --quiet $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:latest
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      - echo Update the REPOSITORY_URI:IMAGE_TAG in task definition...
+      - echo Container image to be used $REPOSITORY_URI:$IMAGE_TAG
+      - sed -i 's@REPOSITORY_URI@'$REPOSITORY_URI'@g' taskdef.json
+      - sed -i 's@IMAGE_TAG@'$IMAGE_TAG'@g' taskdef.json
+      - echo update the REGION in task definition...
+      - sed -i 's@AWS_REGION@'$AWS_REGION'@g' taskdef.json
+      - echo update the roles in task definition and template...
+      - sed -i 's@TASK_EXECUTION_ARN@'$TASK_EXECUTION_ARN'@g' taskdef.json
+      - echo update the task family name in task definition...
+      - sed -i 's@TASK_FAMILY@'$TASK_FAMILY'@g' taskdef.json
+      - echo update the container name in appspec.yaml...
+      - sed -i 's@TASK_FAMILY@'$TASK_FAMILY'@g' appspec.yaml
+  post_build:
+    commands:
+      - echo trivy scan completed on `date`
+      - python3 sechub_parser.py
+artifacts:
+  files:
+    - "appspec.yaml"
+    - "taskdef.json"
+    - "results.json"
